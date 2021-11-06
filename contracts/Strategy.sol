@@ -67,6 +67,9 @@ contract Strategy is BaseStrategy {
     // Minimum collateralization ratio to enforce
     uint256 internal minCollatRatio;
 
+    // If set to true the strategy will never try to repay debt by selling want
+    bool public leaveDebtBehind;
+
     constructor(address _vault, address _yVault) public BaseStrategy(_vault) {
         yVault = IVault(_yVault);
 
@@ -89,6 +92,9 @@ contract Strategy is BaseStrategy {
 
         // Set max acceptable base fee to take on more debt to 60 gwei
         maxAcceptableBaseFee = 60 gwei;
+
+        // If we lose money in yvLUSD then we are not OK selling want to repay it
+        leaveDebtBehind = true;
     }
 
     // ----------------- SETTERS & MIGRATION -----------------
@@ -127,6 +133,14 @@ contract Strategy is BaseStrategy {
     function setMaxLoss(uint256 _maxLoss) external onlyVaultManagers {
         require(_maxLoss <= MAX_LOSS_BPS); // dev: invalid value for max loss
         maxLoss = _maxLoss;
+    }
+
+    // If set to true the strategy will never sell want to repay debts
+    function setLeaveDebtBehind(bool _leaveDebtBehind)
+        external
+        onlyEmergencyAuthorized
+    {
+        leaveDebtBehind = _leaveDebtBehind;
     }
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
@@ -194,7 +208,7 @@ contract Strategy is BaseStrategy {
         // Allow the ratio to move a bit in either direction to avoid cycles
         uint256 currentRatio = getCurrentTroveRatio();
         if (currentRatio < collateralizationRatio.sub(rebalanceTolerance)) {
-            // TODO: _repayDebt(currentRatio);
+            _repayDebt(currentRatio);
         } else if (
             currentRatio > collateralizationRatio.add(rebalanceTolerance)
         ) {
@@ -210,16 +224,57 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        // TODO: Do stuff here to free up to `_amountNeeded` from all positions back into `want`
-        // NOTE: Maintain invariant `want.balanceOf(this) >= _liquidatedAmount`
-        // NOTE: Maintain invariant `_liquidatedAmount + _loss <= _amountNeeded`
+        uint256 balance = balanceOfWant();
 
-        uint256 totalAssets = want.balanceOf(address(this));
-        if (_amountNeeded > totalAssets) {
-            _liquidatedAmount = totalAssets;
-            _loss = _amountNeeded.sub(totalAssets);
+        // Check if we can handle it without freeing collateral
+        if (balance >= _amountNeeded) {
+            return (_amountNeeded, 0);
+        }
+
+        // We only need to free the amount of want not readily available
+        uint256 amountToFree = _amountNeeded.sub(balance);
+
+        uint256 price = priceFeed.fetchPrice();
+        uint256 collateralBalance = balanceOfTrove();
+
+        // We cannot free more than what we have locked
+        amountToFree = Math.min(amountToFree, collateralBalance);
+
+        uint256 totalDebt = balanceOfDebt();
+
+        // If for some reason we do not have debt, make sure the operation does not revert
+        if (totalDebt == 0) {
+            totalDebt = 1;
+        }
+
+        uint256 toFreeIT = amountToFree.mul(price).div(MAX_BPS);
+        uint256 collateralIT = collateralBalance.mul(price).div(MAX_BPS);
+        uint256 newRatio =
+            collateralIT.sub(toFreeIT).mul(MAX_BPS).div(totalDebt);
+
+        // Attempt to repay necessary debt to restore the target collateralization ratio
+        _repayDebt(newRatio);
+
+        // Unlock as much collateral as possible while keeping the target ratio
+        // TODO: amountToFree = Math.min(amountToFree, _maxWithdrawal());
+        // TODO: _freeCollateralAndRepayDai(amountToFree, 0);
+
+        // If we still need more want to repay, we may need to unlock some collateral to sell
+        if (
+            !leaveDebtBehind &&
+            balanceOfWant() < _amountNeeded &&
+            balanceOfDebt() > 0
+        ) {
+            _sellCollateralToRepayRemainingDebtIfNeeded();
+        }
+
+        uint256 looseWant = balanceOfWant();
+        if (_amountNeeded > looseWant) {
+            _liquidatedAmount = looseWant;
+            _loss = _amountNeeded.sub(looseWant);
         } else {
             _liquidatedAmount = _amountNeeded;
+            _loss = 0;
         }
     }
 
@@ -310,6 +365,66 @@ contract Strategy is BaseStrategy {
     }
 
     // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
+
+    function _repayDebt(uint256 currentRatio) internal {
+        // uint256 currentDebt = balanceOfDebt();
+        // // Nothing to repay if we are over the collateralization ratio
+        // // or there is no debt
+        // if (currentRatio > collateralizationRatio || currentDebt == 0) {
+        //     return;
+        // }
+        // // ratio = collateral / debt
+        // // collateral = current_ratio * current_debt
+        // // collateral amount is invariant here so we want to find new_debt
+        // // so that new_debt * desired_ratio = current_debt * current_ratio
+        // // new_debt = current_debt * current_ratio / desired_ratio
+        // // and the amount to repay is the difference between current_debt and new_debt
+        // uint256 newDebt =
+        //     currentDebt.mul(currentRatio).div(collateralizationRatio);
+        // uint256 amountToRepay;
+        // // Maker will revert if the outstanding debt is less than a debt floor
+        // // called 'dust'. If we are there we need to either pay the debt in full
+        // // or leave at least 'dust' balance (10,000 DAI for YFI-A)
+        // uint256 debtFloor = MakerDaiDelegateLib.debtFloor(ilk);
+        // if (newDebt <= debtFloor) {
+        //     // If we sold want to repay debt we will have DAI readily available in the strategy
+        //     // This means we need to count both yvDAI shares and current DAI balance
+        //     uint256 totalInvestmentAvailableToRepay =
+        //         _valueOfInvestment().add(balanceOfInvestmentToken());
+        //     if (totalInvestmentAvailableToRepay >= currentDebt) {
+        //         // Pay the entire debt if we have enough investment token
+        //         amountToRepay = currentDebt;
+        //     } else {
+        //         // Pay just 0.1 cent above debtFloor (best effort without liquidating want)
+        //         amountToRepay = currentDebt.sub(debtFloor).sub(1e15);
+        //     }
+        // } else {
+        //     // If we are not near the debt floor then just pay the exact amount
+        //     // needed to obtain a healthy collateralization ratio
+        //     amountToRepay = currentDebt.sub(newDebt);
+        // }
+        // uint256 balanceIT = balanceOfInvestmentToken();
+        // if (amountToRepay > balanceIT) {
+        //     _withdrawFromYVault(amountToRepay.sub(balanceIT));
+        // }
+        // _repayInvestmentTokenDebt(amountToRepay);
+    }
+
+    function _sellCollateralToRepayRemainingDebtIfNeeded() internal {
+        uint256 currentInvestmentValue = _valueOfInvestment();
+
+        uint256 investmentLeftToAcquire =
+            balanceOfDebt().sub(currentInvestmentValue);
+
+        uint256 investmentLeftToAcquireInWant =
+            _convertInvestmentTokenToWant(investmentLeftToAcquire);
+
+        if (investmentLeftToAcquireInWant <= balanceOfWant()) {
+            // TODO: _buyInvestmentTokenWithWant(investmentLeftToAcquire);
+            _repayDebt(0);
+            // TODO: _freeCollateralAndRepayDai(balanceOfMakerVault(), 0);
+        }
+    }
 
     function _withdrawFromYVault(uint256 _amountIT) internal returns (uint256) {
         if (_amountIT == 0) {
