@@ -97,6 +97,9 @@ contract Strategy is BaseStrategy {
         leaveDebtBehind = true;
     }
 
+    // Strategy should be able to receive ETH
+    receive() external payable {}
+
     // ----------------- SETTERS & MIGRATION -----------------
 
     // Maximum acceptable base fee of current block to take on more debt
