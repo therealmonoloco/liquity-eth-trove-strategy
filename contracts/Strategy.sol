@@ -27,6 +27,10 @@ contract Strategy is BaseStrategy {
     IERC20 internal constant investmentToken =
         IERC20(0x5f98805A4E8be255a32880FDeC7F6728C6568bA0);
 
+    // Wrapped ether
+    IERC20 internal constant WETH =
+        IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+
     // Chainlink ETH:USD with Tellor ETH:USD as fallback
     IPriceFeed internal constant priceFeed =
         IPriceFeed(0x4c517D4e2C851CA76d7eC94B805269Df0f2201De);
@@ -157,8 +161,12 @@ contract Strategy is BaseStrategy {
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
-        // TODO: Build a more accurate estimate using the value of all positions in terms of `want`
-        return want.balanceOf(address(this));
+        return
+            balanceOfWant()
+                .add(balanceOfTrove())
+                .add(_convertInvestmentTokenToWant(balanceOfInvestmentToken()))
+                .add(_convertInvestmentTokenToWant(_valueOfInvestment()))
+                .sub(_convertInvestmentTokenToWant(balanceOfDebt()));
     }
 
     function prepareReturn(uint256 _debtOutstanding)
