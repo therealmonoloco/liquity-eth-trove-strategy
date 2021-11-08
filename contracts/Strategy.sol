@@ -219,8 +219,6 @@ contract Strategy is BaseStrategy {
         // Claim rewards from yVault
         _takeYVaultProfit();
 
-        // TODO: handle potential ETH rewards
-
         uint256 totalAssetsAfterProfit = estimatedTotalAssets();
 
         _profit = totalAssetsAfterProfit > totalDebt
@@ -307,7 +305,6 @@ contract Strategy is BaseStrategy {
 
         // Unlock as much collateral as possible while keeping the target ratio
         amountToFree = Math.min(amountToFree, _maxWithdrawal());
-
         _withdrawCollateralFromTrove(amountToFree);
 
         // If we still need more want to repay, we may need to unlock some collateral to sell
@@ -391,7 +388,7 @@ contract Strategy is BaseStrategy {
         override
         returns (uint256)
     {
-        return _amtInWei.mul(priceFeed.lastGoodPrice()).div(1e18);
+        return _amtInWei.mul(priceFeed.lastGoodPrice()).div(MAX_BPS);
     }
 
     // ----------------- PUBLIC BALANCES AND CALCS -----------------
@@ -707,7 +704,7 @@ contract Strategy is BaseStrategy {
         view
         returns (uint256)
     {
-        return amount.mul(1e18).div(priceFeed.lastGoodPrice());
+        return amount.mul(MAX_BPS).div(priceFeed.lastGoodPrice());
     }
 
     function _sellLUSDforWETH() internal {
