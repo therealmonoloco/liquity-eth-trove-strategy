@@ -3,6 +3,11 @@ from brownie import config
 from brownie import Contract
 
 
+@pytest.fixture(autouse=True)
+def isolation(fn_isolation):
+    pass
+
+
 @pytest.fixture
 def gov(accounts):
     yield accounts.at("0xFEB4acf3df3cDEA7399794D0869ef76A6EfAff52", force=True)
@@ -39,19 +44,28 @@ def keeper(accounts):
 
 
 @pytest.fixture
-def token():
-    token_address = "0x6b175474e89094c44da98b954eedeac495271d0f"  # this should be the address of the ERC-20 used by the strategy/vault (DAI)
-    yield Contract(token_address)
+def healthCheck():
+    yield Contract("0xDDCea799fF1699e98EDF118e0629A974Df7DF012")
 
 
 @pytest.fixture
-def amount(accounts, token, user):
-    amount = 10_000 * 10 ** token.decimals()
+def amount(accounts, weth, user):
+    amount = 1_000 * 10 ** weth.decimals()
     # In order to get some funds for the token you are about to use,
     # it impersonate an exchange address to use it's funds.
-    reserve = accounts.at("0x5d3a536E4D6DbD6114cc1Ead35777bAB948E3643", force=True)
-    token.transfer(user, amount, {"from": reserve})
+    reserve = accounts.at("0x31F8Cc382c9898b273eff4e0b7626a6987C846E8", force=True)
+    weth.transfer(user, amount, {"from": reserve})
     yield amount
+
+
+@pytest.fixture
+def lusd():
+    yield Contract("0x5f98805A4E8be255a32880FDeC7F6728C6568bA0")
+
+
+@pytest.fixture
+def lusd_whale(accounts):
+    yield accounts.at("0x31F8Cc382c9898b273eff4e0b7626a6987C846E8", force=True)
 
 
 @pytest.fixture
@@ -61,26 +75,42 @@ def weth():
 
 
 @pytest.fixture
-def weth_amout(user, weth):
-    weth_amout = 10 ** weth.decimals()
-    user.transfer(weth, weth_amout)
-    yield weth_amout
+def weth_whale(accounts):
+    yield accounts.at("0x2F0b23f53734252Bda2277357e97e1517d6B042A", force=True)
 
 
 @pytest.fixture
-def vault(pm, gov, rewards, guardian, management, token):
+def yvault(pm, gov, rewards, guardian, management, lusd):
     Vault = pm(config["dependencies"][0]).Vault
     vault = guardian.deploy(Vault)
-    vault.initialize(token, gov, rewards, "", "", guardian, management)
+    vault.initialize(lusd, gov, rewards, "", "", guardian, management)
     vault.setDepositLimit(2 ** 256 - 1, {"from": gov})
     vault.setManagement(management, {"from": gov})
     yield vault
 
 
 @pytest.fixture
-def strategy(strategist, keeper, vault, Strategy, gov):
-    strategy = strategist.deploy(Strategy, vault)
+def weth_amount(user, weth):
+    weth_amount = 10 ** weth.decimals()
+    user.transfer(weth, weth_amount)
+    yield weth_amount
+
+
+@pytest.fixture
+def vault(pm, gov, rewards, guardian, management, weth):
+    Vault = pm(config["dependencies"][0]).Vault
+    vault = guardian.deploy(Vault)
+    vault.initialize(weth, gov, rewards, "", "", guardian, management)
+    vault.setDepositLimit(2 ** 256 - 1, {"from": gov})
+    vault.setManagement(management, {"from": gov})
+    yield vault
+
+
+@pytest.fixture
+def strategy(strategist, keeper, vault, yvault, Strategy, gov):
+    strategy = strategist.deploy(Strategy, vault, yvault)
     strategy.setKeeper(keeper)
+    strategy.setDoHealthCheck(True, {"from": gov})
     vault.addStrategy(strategy, 10_000, 0, 2 ** 256 - 1, 1_000, {"from": gov})
     yield strategy
 
