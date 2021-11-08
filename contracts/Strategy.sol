@@ -15,6 +15,7 @@ import {
 import "../interfaces/liquity/IBorrowerOperations.sol";
 import "../interfaces/liquity/IPriceFeed.sol";
 import "../interfaces/liquity/ITroveManager.sol";
+import "../interfaces/weth/IWETH9.sol";
 import "../interfaces/yearn/IBaseFee.sol";
 import "../interfaces/yearn/IVault.sol";
 
@@ -28,8 +29,8 @@ contract Strategy is BaseStrategy {
         IERC20(0x5f98805A4E8be255a32880FDeC7F6728C6568bA0);
 
     // Wrapped ether
-    IERC20 internal constant WETH =
-        IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IWETH9 internal constant WETH =
+        IWETH9(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
 
     // Chainlink ETH:USD with Tellor ETH:USD as fallback
     IPriceFeed internal constant priceFeed =
@@ -53,6 +54,9 @@ contract Strategy is BaseStrategy {
     // Maximum loss on withdrawal from yVault
     uint256 internal constant MAX_LOSS_BPS = 10000;
 
+    // Minimum debt in LUSD allowed by the protocol
+    uint256 internal constant MIN_DEBT = 2000 * 1e18;
+
     // LUSD yVault
     IVault public yVault;
 
@@ -64,6 +68,9 @@ contract Strategy is BaseStrategy {
 
     // Max acceptable base fee to take more debt or harvest
     uint256 public maxAcceptableBaseFee;
+
+    // Max fee slippage to accept when borrowing LUSD
+    uint256 public maxFeePercentage;
 
     // Maximum acceptable loss on withdrawal. Default to 0.01%.
     uint256 public maxLoss;
@@ -90,6 +97,9 @@ contract Strategy is BaseStrategy {
         // Never allow rebalancing band to go below 150%
         // Troves below 150% become liquidatable if system goes into Recovery Mode
         minCollatRatio = (150 * MAX_BPS) / 100;
+
+        // Maximum 0.01% fee slippage
+        maxFeePercentage = 10000000000000000;
 
         // Define maximum acceptable loss on withdrawal to be 0.01%.
         maxLoss = 1;
@@ -182,6 +192,8 @@ contract Strategy is BaseStrategy {
 
         // Claim rewards from yVault
         _takeYVaultProfit();
+
+        // TODO: handle potential ETH rewards
 
         uint256 totalAssetsAfterProfit = estimatedTotalAssets();
 
@@ -364,61 +376,64 @@ contract Strategy is BaseStrategy {
     }
 
     function balanceOfDebt() public view returns (uint256) {
-        // TODO
+        return troveManager.getTroveDebt(address(this));
     }
 
     function balanceOfTrove() public view returns (uint256) {
-        // TODO
+        return troveManager.getTroveColl(address(this));
     }
 
     function getCurrentTroveRatio() public view returns (uint256) {
-        // TODO
+        return
+            balanceOfTrove().mul(priceFeed.lastGoodPrice()).div(
+                balanceOfDebt()
+            );
     }
 
     // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
 
     function _repayDebt(uint256 currentRatio) internal {
-        // uint256 currentDebt = balanceOfDebt();
-        // // Nothing to repay if we are over the collateralization ratio
-        // // or there is no debt
-        // if (currentRatio > collateralizationRatio || currentDebt == 0) {
-        //     return;
-        // }
-        // // ratio = collateral / debt
-        // // collateral = current_ratio * current_debt
-        // // collateral amount is invariant here so we want to find new_debt
-        // // so that new_debt * desired_ratio = current_debt * current_ratio
-        // // new_debt = current_debt * current_ratio / desired_ratio
-        // // and the amount to repay is the difference between current_debt and new_debt
-        // uint256 newDebt =
-        //     currentDebt.mul(currentRatio).div(collateralizationRatio);
-        // uint256 amountToRepay;
-        // // Maker will revert if the outstanding debt is less than a debt floor
-        // // called 'dust'. If we are there we need to either pay the debt in full
-        // // or leave at least 'dust' balance (10,000 DAI for YFI-A)
-        // uint256 debtFloor = MakerDaiDelegateLib.debtFloor(ilk);
-        // if (newDebt <= debtFloor) {
-        //     // If we sold want to repay debt we will have DAI readily available in the strategy
-        //     // This means we need to count both yvDAI shares and current DAI balance
-        //     uint256 totalInvestmentAvailableToRepay =
-        //         _valueOfInvestment().add(balanceOfInvestmentToken());
-        //     if (totalInvestmentAvailableToRepay >= currentDebt) {
-        //         // Pay the entire debt if we have enough investment token
-        //         amountToRepay = currentDebt;
-        //     } else {
-        //         // Pay just 0.1 cent above debtFloor (best effort without liquidating want)
-        //         amountToRepay = currentDebt.sub(debtFloor).sub(1e15);
-        //     }
-        // } else {
-        //     // If we are not near the debt floor then just pay the exact amount
-        //     // needed to obtain a healthy collateralization ratio
-        //     amountToRepay = currentDebt.sub(newDebt);
-        // }
-        // uint256 balanceIT = balanceOfInvestmentToken();
-        // if (amountToRepay > balanceIT) {
-        //     _withdrawFromYVault(amountToRepay.sub(balanceIT));
-        // }
-        // _repayInvestmentTokenDebt(amountToRepay);
+        uint256 currentDebt = balanceOfDebt();
+
+        // Nothing to repay if we are over the collateralization ratio
+        // or there is no debt
+        if (currentRatio > collateralizationRatio || currentDebt == 0) {
+            return;
+        }
+
+        // ratio = collateral / debt
+        // collateral = current_ratio * current_debt
+        // collateral amount is invariant here so we want to find new_debt
+        // so that new_debt * desired_ratio = current_debt * current_ratio
+        // new_debt = current_debt * current_ratio / desired_ratio
+        // and the amount to repay is the difference between current_debt and new_debt
+        uint256 newDebt =
+            currentDebt.mul(currentRatio).div(collateralizationRatio);
+        uint256 amountToRepay;
+
+        // Liquity does not allow having less debt than 2,000 LUSD
+        if (newDebt <= MIN_DEBT) {
+            // If we sold want to repay debt we will have LUSD readily available in the strategy
+            // This means we need to count both yvLUSD shares and current LUSD balance
+            uint256 totalInvestmentAvailableToRepay =
+                _valueOfInvestment().add(balanceOfInvestmentToken());
+            if (totalInvestmentAvailableToRepay >= currentDebt) {
+                // Pay the entire debt if we have enough investment token
+                amountToRepay = currentDebt;
+            } else {
+                // Pay just 0.1 cent above min debt (best effort without liquidating want)
+                amountToRepay = currentDebt.sub(MIN_DEBT).sub(1e15);
+            }
+        } else {
+            // If we are not near the debt floor then just pay the exact amount
+            // needed to obtain a healthy collateralization ratio
+            amountToRepay = currentDebt.sub(newDebt);
+        }
+        uint256 balanceIT = balanceOfInvestmentToken();
+        if (amountToRepay > balanceIT) {
+            _withdrawFromYVault(amountToRepay.sub(balanceIT));
+        }
+        _repayInvestmentTokenDebt(amountToRepay);
     }
 
     function _sellCollateralToRepayRemainingDebtIfNeeded() internal {
@@ -468,6 +483,32 @@ contract Strategy is BaseStrategy {
         }
     }
 
+    function _repayInvestmentTokenDebt(uint256 amount) internal {
+        if (amount == 0) {
+            return;
+        }
+
+        uint256 debt = balanceOfDebt();
+        uint256 balanceIT = balanceOfInvestmentToken();
+
+        // We cannot pay more than loose balance
+        amount = Math.min(amount, balanceIT);
+
+        // We cannot pay more than we owe
+        amount = Math.min(amount, debt);
+
+        _checkAllowance(
+            address(borrowerOperations),
+            address(investmentToken),
+            amount
+        );
+
+        if (amount > 0) {
+            // TODO: provide _upperHint and _lowerHint to consume less gas
+            borrowerOperations.repayLUSD(amount, address(this), address(this));
+        }
+    }
+
     function _checkAllowance(
         address _contract,
         address _token,
@@ -503,7 +544,72 @@ contract Strategy is BaseStrategy {
             return;
         }
 
-        // TODO: add collateral and borrow LUSD
+        uint256 price = priceFeed.fetchPrice();
+        uint256 lusdToMint =
+            amount.mul(price).mul(MAX_BPS).div(collateralizationRatio).div(
+                MAX_BPS
+            );
+
+        // Need to unwrap WETH to ETH
+        WETH.withdraw(amount);
+
+        if (balanceOfTrove() == 0) {
+            // If this is the first time we need to open a new trove
+            // TODO: provide _upperHint and _lowerHint to consume less gas
+            borrowerOperations.openTrove{value: amount}(
+                maxFeePercentage,
+                lusdToMint,
+                address(this),
+                address(this)
+            );
+        } else {
+            // Add collateral to existing trove and mint excess LUSD
+            // TODO: provide _upperHint and _lowerHint to consume less gas
+            // TODO: should check borrowing fee before minting?
+            borrowerOperations.addColl{value: amount}(
+                address(this),
+                address(this)
+            );
+            borrowerOperations.withdrawLUSD(
+                maxFeePercentage,
+                lusdToMint,
+                address(this),
+                address(this)
+            );
+        }
+    }
+
+    // Returns maximum collateral to withdraw while maintaining the target collateralization ratio
+    function _maxWithdrawal() internal view returns (uint256) {
+        // Denominated in want
+        uint256 totalCollateral = balanceOfTrove();
+
+        // Denominated in investment token
+        uint256 totalDebt = balanceOfDebt();
+
+        // If there is no debt to repay we can withdraw all the locked collateral
+        if (totalDebt == 0) {
+            return totalCollateral;
+        }
+
+        uint256 price = priceFeed.lastGoodPrice();
+
+        // Min collateral in want that needs to be locked with the outstanding debt
+        // Allow going to the lower rebalancing band
+        uint256 minCollateral =
+            collateralizationRatio
+                .sub(rebalanceTolerance)
+                .mul(totalDebt)
+                .mul(MAX_BPS)
+                .div(price)
+                .div(MAX_BPS);
+
+        // If we are under collateralized then it is not safe for us to withdraw anything
+        if (minCollateral > totalCollateral) {
+            return 0;
+        }
+
+        return totalCollateral.sub(minCollateral);
     }
 
     // ----------------- INTERNAL CALCS -----------------
