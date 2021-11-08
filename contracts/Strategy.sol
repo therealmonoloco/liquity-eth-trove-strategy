@@ -72,7 +72,10 @@ contract Strategy is BaseStrategy {
     // Max fee slippage to accept when borrowing LUSD
     uint256 public maxFeePercentage;
 
-    // Maximum acceptable loss on withdrawal. Default to 0.01%.
+    // Max acceptable fee to pay when borrowing LUSD (min is 0.5%)
+    uint256 public maxBorrowingRate;
+
+    // Maximum acceptable loss on withdrawal. Default to 1%.
     uint256 public maxLoss;
 
     // Minimum collateralization ratio to enforce
@@ -101,8 +104,11 @@ contract Strategy is BaseStrategy {
         // Maximum 0.01% fee slippage
         maxFeePercentage = 10000000000000000;
 
-        // Define maximum acceptable loss on withdrawal to be 0.01%.
-        maxLoss = 1;
+        // Define maximum acceptable loss on withdrawal to be 1%.
+        maxLoss = 100;
+
+        // Define maximum acceptable borrowing fee to be 0.55%
+        maxBorrowingRate = 5500000000000000;
 
         // Set max acceptable base fee to take on more debt to 60 gwei
         maxAcceptableBaseFee = 60 gwei;
@@ -217,7 +223,7 @@ contract Strategy is BaseStrategy {
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
-        // Make sure price is up to date
+        // Make sure lastGoodPrice is up to date
         priceFeed.fetchPrice();
 
         // If we have enough want to deposit more into the trove, we do it
@@ -233,9 +239,10 @@ contract Strategy is BaseStrategy {
         if (currentRatio < collateralizationRatio.sub(rebalanceTolerance)) {
             _repayDebt(currentRatio);
         } else if (
-            currentRatio > collateralizationRatio.add(rebalanceTolerance)
+            currentRatio > collateralizationRatio.add(rebalanceTolerance) &&
+            troveManager.getBorrowingRate() < maxBorrowingRate
         ) {
-            // TODO: _mintMoreInvestmentToken();
+            _mintMoreInvestmentToken();
         }
 
         // If we have anything left to invest then deposit into the yVault
@@ -279,8 +286,9 @@ contract Strategy is BaseStrategy {
         _repayDebt(newRatio);
 
         // Unlock as much collateral as possible while keeping the target ratio
-        // TODO: amountToFree = Math.min(amountToFree, _maxWithdrawal());
-        // TODO: _freeCollateralAndRepayDai(amountToFree, 0);
+        amountToFree = Math.min(amountToFree, _maxWithdrawal());
+
+        _withdrawCollateralFromTrove(amountToFree);
 
         // If we still need more want to repay, we may need to unlock some collateral to sell
         if (
@@ -315,8 +323,7 @@ contract Strategy is BaseStrategy {
         override
         returns (bool)
     {
-        // TODO: conditions to harvest
-        // return isCurrentBaseFeeAcceptable() && super.harvestTrigger(callCost);
+        return isCurrentBaseFeeAcceptable() && super.harvestTrigger(callCost);
     }
 
     function tendTrigger(uint256 callCostInWei)
@@ -325,7 +332,7 @@ contract Strategy is BaseStrategy {
         override
         returns (bool)
     {
-        // Nothing to adjust if there is no collateral locked
+        // Nothing to adjust if there is no collateral locked or we have no debt
         if (balanceOfTrove() == 0) {
             return false;
         }
@@ -338,14 +345,16 @@ contract Strategy is BaseStrategy {
             return true;
         }
 
-        // TODO: conditions to mint more LUSD
-        return false;
+        // If planets are aligned then mint more LUSD
+        return
+            currentRatio > collateralizationRatio.add(rebalanceTolerance) &&
+            balanceOfDebt() > 0 &&
+            troveManager.getBorrowingRate() < maxBorrowingRate &&
+            isCurrentBaseFeeAcceptable();
     }
 
     function prepareMigration(address _newStrategy) internal override {
-        // TODO: Transfer any non-`want` tokens to the new strategy
-        // NOTE: `migrate` will automatically forward all `want` in this strategy to the new one
-        // TODO: redeem all collateral and send it to new strategy
+        // Trove cannot be migrated so nothing to do here
     }
 
     function protectedTokens()
@@ -390,7 +399,42 @@ contract Strategy is BaseStrategy {
             );
     }
 
+    // Check if current block's base fee is under max allowed base fee
+    function isCurrentBaseFeeAcceptable() public view returns (bool) {
+        uint256 baseFee;
+        try baseFeeProvider.basefee_global() returns (uint256 currentBaseFee) {
+            baseFee = currentBaseFee;
+        } catch {
+            // Useful for testing until ganache supports london fork
+            // Hard-code current base fee to 1000 gwei
+            // This should also help keepers that run in a fork without
+            // baseFee() to avoid reverting and potentially abandoning the job
+            baseFee = 1000 * 1e9;
+        }
+
+        return baseFee <= maxAcceptableBaseFee;
+    }
+
     // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
+
+    function _withdrawLUSDFromTrove(uint256 amount) internal {
+        // TODO: provide hints
+        borrowerOperations.withdrawLUSD(
+            maxFeePercentage,
+            amount,
+            address(this),
+            address(this)
+        );
+    }
+
+    function _withdrawCollateralFromTrove(uint256 amount) internal {
+        // TODO: adjust upper and lower hints
+        // TODO: repaying all debt should take collateral out of the trove to avoid redemptions
+        borrowerOperations.withdrawColl(amount, address(this), address(this));
+
+        // Wrap ETH
+        WETH.deposit();
+    }
 
     function _repayDebt(uint256 currentRatio) internal {
         uint256 currentDebt = balanceOfDebt();
@@ -448,8 +492,24 @@ contract Strategy is BaseStrategy {
         if (investmentLeftToAcquireInWant <= balanceOfWant()) {
             // TODO: _buyInvestmentTokenWithWant(investmentLeftToAcquire);
             _repayDebt(0);
-            // TODO: _freeCollateralAndRepayDai(balanceOfMakerVault(), 0);
+            // TODO: should we use closeTrove() instead?
+            _withdrawCollateralFromTrove(balanceOfTrove());
         }
+    }
+
+    // Mint the maximum LUSD possible for the locked collateral
+    // Assumes borrowing rate is acceptable and has been checked before calling
+    function _mintMoreInvestmentToken() internal {
+        uint256 price = priceFeed.fetchPrice();
+        uint256 amount = balanceOfTrove();
+
+        uint256 lusdToMint =
+            amount.mul(price).mul(MAX_BPS).div(collateralizationRatio).div(
+                MAX_BPS
+            );
+        lusdToMint = lusdToMint.sub(balanceOfDebt());
+
+        _withdrawLUSDFromTrove(lusdToMint);
     }
 
     function _withdrawFromYVault(uint256 _amountIT) internal returns (uint256) {
@@ -540,7 +600,7 @@ contract Strategy is BaseStrategy {
     }
 
     function _depositToTrove(uint256 amount) internal {
-        if (amount == 0) {
+        if (amount == 0 || troveManager.getBorrowingRate() > maxBorrowingRate) {
             return;
         }
 
@@ -565,17 +625,11 @@ contract Strategy is BaseStrategy {
         } else {
             // Add collateral to existing trove and mint excess LUSD
             // TODO: provide _upperHint and _lowerHint to consume less gas
-            // TODO: should check borrowing fee before minting?
             borrowerOperations.addColl{value: amount}(
                 address(this),
                 address(this)
             );
-            borrowerOperations.withdrawLUSD(
-                maxFeePercentage,
-                lusdToMint,
-                address(this),
-                address(this)
-            );
+            _withdrawLUSDFromTrove(lusdToMint);
         }
     }
 
