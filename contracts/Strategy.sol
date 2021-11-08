@@ -54,13 +54,17 @@ contract Strategy is BaseStrategy {
         ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
 
     // 100%
-    uint256 internal constant MAX_BPS = 1e18;
+    uint256 internal constant MAX_BPS = 1000000000000000000;
 
     // Maximum loss on withdrawal from yVault
     uint256 internal constant MAX_LOSS_BPS = 10000;
 
-    // Minimum debt in LUSD allowed by the protocol
-    uint256 internal constant MIN_DEBT = 2000 * 1e18;
+    // Minimum debt in LUSD allowed by the protocol (2,000 LUSD)
+    uint256 internal constant MIN_DEBT = 2000000000000000000000;
+
+    // Minimum collateralization ratio to enforce
+    // Troves below 150% become liquidatable if system goes into Recovery Mode
+    uint256 internal constant MIN_COLLAT_RATIO = 1500000000000000000;
 
     // LUSD yVault
     IVault public yVault;
@@ -83,9 +87,6 @@ contract Strategy is BaseStrategy {
     // Maximum acceptable loss on withdrawal. Default to 1%.
     uint256 public maxLoss;
 
-    // Minimum collateralization ratio to enforce
-    uint256 internal minCollatRatio;
-
     // If set to true the strategy will never try to repay debt by selling want
     bool public leaveDebtBehind;
 
@@ -101,10 +102,6 @@ contract Strategy is BaseStrategy {
 
         // Use 200% as target
         collateralizationRatio = (200 * MAX_BPS) / 100;
-
-        // Never allow rebalancing band to go below 150%
-        // Troves below 150% become liquidatable if system goes into Recovery Mode
-        minCollatRatio = (150 * MAX_BPS) / 100;
 
         // Maximum 0.01% fee slippage
         maxFeePercentage = 10000000000000000;
@@ -127,6 +124,24 @@ contract Strategy is BaseStrategy {
 
     // ----------------- SETTERS & MIGRATION -----------------
 
+    // Maximum acceptable borrowing fee (protocol minimum is 0.5%)
+    // Allow lower values to effectively disable taking more debt
+    function setMaxBorrowingRate(uint256 _maxBorrowingRate)
+        external
+        onlyEmergencyAuthorized
+    {
+        maxBorrowingRate = _maxBorrowingRate;
+    }
+
+    // Max fee slippage to accept when borrowing LUSD
+    // This is done to cover from huge redemptions that may increase the fee
+    function setMaxFeePercentage(uint256 _maxFeePercentage)
+        external
+        onlyEmergencyAuthorized
+    {
+        maxFeePercentage = _maxFeePercentage;
+    }
+
     // Maximum acceptable base fee of current block to take on more debt
     function setMaxAcceptableBaseFee(uint256 _maxAcceptableBaseFee)
         external
@@ -141,7 +156,7 @@ contract Strategy is BaseStrategy {
         onlyEmergencyAuthorized
     {
         require(
-            _collateralizationRatio.sub(rebalanceTolerance) > minCollatRatio
+            _collateralizationRatio.sub(rebalanceTolerance) > MIN_COLLAT_RATIO
         ); // dev: desired collateralization ratio is too low
         collateralizationRatio = _collateralizationRatio;
     }
@@ -152,7 +167,7 @@ contract Strategy is BaseStrategy {
         onlyEmergencyAuthorized
     {
         require(
-            collateralizationRatio.sub(_rebalanceTolerance) > minCollatRatio
+            collateralizationRatio.sub(_rebalanceTolerance) > MIN_COLLAT_RATIO
         ); // dev: desired rebalance tolerance makes allowed ratio too low
         rebalanceTolerance = _rebalanceTolerance;
     }
