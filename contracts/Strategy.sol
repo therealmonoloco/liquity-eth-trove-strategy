@@ -488,14 +488,15 @@ contract Strategy is BaseStrategy {
     function _sellCollateralToRepayRemainingDebtIfNeeded() internal {
         uint256 currentInvestmentValue = _valueOfInvestment();
 
+        // Add extra 2% for fees and slippage
         uint256 investmentLeftToAcquire =
-            balanceOfDebt().sub(currentInvestmentValue);
+            balanceOfDebt().sub(currentInvestmentValue).mul(102).div(100);
 
         uint256 investmentLeftToAcquireInWant =
             _convertInvestmentTokenToWant(investmentLeftToAcquire);
 
         if (investmentLeftToAcquireInWant <= balanceOfWant()) {
-            // TODO: _buyInvestmentTokenWithWant(investmentLeftToAcquire);
+            _buyLUSDwithWETH(investmentLeftToAcquire);
             _repayDebt(0);
             // TODO: should we use closeTrove() instead?
             _withdrawCollateralFromTrove(balanceOfTrove());
@@ -571,17 +572,6 @@ contract Strategy is BaseStrategy {
         if (amount > 0) {
             // TODO: provide _upperHint and _lowerHint to consume less gas
             borrowerOperations.repayLUSD(amount, address(this), address(this));
-        }
-    }
-
-    function _checkAllowance(
-        address _contract,
-        address _token,
-        uint256 _amount
-    ) internal {
-        if (IERC20(_token).allowance(address(this), _contract) < _amount) {
-            IERC20(_token).safeApprove(_contract, 0);
-            IERC20(_token).safeApprove(_contract, type(uint256).max);
         }
     }
 
@@ -667,6 +657,17 @@ contract Strategy is BaseStrategy {
         return totalCollateral.sub(minCollateral);
     }
 
+    function _checkAllowance(
+        address _contract,
+        address _token,
+        uint256 _amount
+    ) internal {
+        if (IERC20(_token).allowance(address(this), _contract) < _amount) {
+            IERC20(_token).safeApprove(_contract, 0);
+            IERC20(_token).safeApprove(_contract, type(uint256).max);
+        }
+    }
+
     // ----------------- INTERNAL CALCS -----------------
 
     function _valueOfInvestment() internal view returns (uint256) {
@@ -703,6 +704,22 @@ contract Strategy is BaseStrategy {
                 address(this), // recipient
                 now, // deadline
                 investmentToken.balanceOf(address(this)), // amountIn
+                0, // amountOut
+                0 // sqrtPriceLimitX96
+            );
+
+        router.exactInputSingle(params);
+    }
+
+    function _buyLUSDwithWETH(uint256 amount) internal {
+        ISwapRouter.ExactInputSingleParams memory params =
+            ISwapRouter.ExactInputSingleParams(
+                address(WETH), // tokenIn
+                address(investmentToken), // tokenOut
+                3000, // 0.3% fee
+                address(this), // recipient
+                now, // deadline
+                amount, // amountIn
                 0, // amountOut
                 0 // sqrtPriceLimitX96
             );
