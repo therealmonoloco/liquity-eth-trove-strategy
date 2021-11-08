@@ -15,6 +15,7 @@ import {
 import "../interfaces/liquity/IBorrowerOperations.sol";
 import "../interfaces/liquity/IPriceFeed.sol";
 import "../interfaces/liquity/ITroveManager.sol";
+import "../interfaces/uniswap/ISwapRouter.sol";
 import "../interfaces/weth/IWETH9.sol";
 import "../interfaces/yearn/IBaseFee.sol";
 import "../interfaces/yearn/IVault.sol";
@@ -47,6 +48,10 @@ contract Strategy is BaseStrategy {
     // Trove Manager
     ITroveManager internal constant troveManager =
         ITroveManager(0xA39739EF8b0231DbFA0DcdA07d7e29faAbCf4bb2);
+
+    // Uniswap v3 router to do LUSD->ETH
+    ISwapRouter internal constant router =
+        ISwapRouter(0xE592427A0AEce92De3Edee1F18E0157C05861564);
 
     // 100%
     uint256 internal constant MAX_BPS = 1e18;
@@ -591,11 +596,7 @@ contract Strategy is BaseStrategy {
         uint256 ySharesToWithdraw = _investmentTokenToYShares(profit);
         if (ySharesToWithdraw > 0) {
             yVault.withdraw(ySharesToWithdraw, address(this), maxLoss);
-            _sellAForB(
-                balanceOfInvestmentToken(),
-                address(investmentToken),
-                address(want)
-            );
+            _sellLUSDforWETH();
         }
     }
 
@@ -693,11 +694,19 @@ contract Strategy is BaseStrategy {
         return amount.mul(1e18).div(priceFeed.lastGoodPrice());
     }
 
-    function _sellAForB(
-        uint256 _amount,
-        address tokenA,
-        address tokenB
-    ) internal {
-        // TODO swap
+    function _sellLUSDforWETH() internal {
+        ISwapRouter.ExactInputSingleParams memory params =
+            ISwapRouter.ExactInputSingleParams(
+                address(investmentToken), // tokenIn
+                address(WETH), // tokenOut
+                3000, // 0.3% fee
+                address(this), // recipient
+                now, // deadline
+                investmentToken.balanceOf(address(this)), // amountIn
+                0, // amountOut
+                0 // sqrtPriceLimitX96
+            );
+
+        router.exactInputSingle(params);
     }
 }
