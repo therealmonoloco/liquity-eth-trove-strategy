@@ -71,6 +71,8 @@ interface ITroveManager {
         address _lqtyStakingAddress
     ) external;
 
+    function LUSD_GAS_COMPENSATION() external view returns (uint256);
+
     function getTroveOwnersCount() external view returns (uint256);
 
     function getTroveFromTroveOwnersArray(uint256 _index)

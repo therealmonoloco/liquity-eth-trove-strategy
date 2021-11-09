@@ -13,7 +13,9 @@ import {
 } from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
 import "../interfaces/liquity/IBorrowerOperations.sol";
+import "../interfaces/liquity/IHintHelpers.sol";
 import "../interfaces/liquity/IPriceFeed.sol";
+import "../interfaces/liquity/ISortedTroves.sol";
 import "../interfaces/liquity/ITroveManager.sol";
 import "../interfaces/uniswap/ISwapRouter.sol";
 import "../interfaces/weth/IWETH9.sol";
@@ -48,6 +50,14 @@ contract Strategy is BaseStrategy {
     // Trove Manager
     ITroveManager internal constant troveManager =
         ITroveManager(0xA39739EF8b0231DbFA0DcdA07d7e29faAbCf4bb2);
+
+    // Hint helper to optimize trove insertions
+    IHintHelpers internal constant hintHelpers =
+        IHintHelpers(0xE84251b93D9524E0d2e621Ba7dc7cb3579F997C0);
+
+    // Hint helper to optimize trove insertions
+    ISortedTroves internal constant sortedTroves =
+        ISortedTroves(0x8FdD3fbFEb32b28fb73555518f8b361bCeA741A6);
 
     // Uniswap v3 router to do LUSD->ETH
     ISwapRouter internal constant router =
@@ -619,11 +629,23 @@ contract Strategy is BaseStrategy {
         if (balanceOfTrove() == 0) {
             // If this is the first time we need to open a new trove
             // TODO: provide _upperHint and _lowerHint to consume less gas
+
+            uint256 numTroves = sortedTroves.getSize();
+            uint256 liquidationReserve = troveManager.LUSD_GAS_COMPENSATION();
+            uint256 expectedFee = troveManager.getBorrowingFeeWithDecay(lusdToMint);
+            uint256 expectedDebt = lusdToMint.add(expectedFee).add(liquidationReserve);
+            uint256 nicr = amount.mul(100).mul(1e18).div(expectedDebt);
+
+            (address approxHint, ,) = hintHelpers.getApproxHint(nicr, numTroves.mul(15), 123123);
+
+            (address upperHint, address lowerHint) = sortedTroves.findInsertPosition(nicr, approxHint, approxHint);
+            
+
             borrowerOperations.openTrove{value: amount}(
                 maxFeePercentage,
                 lusdToMint,
-                address(this),
-                address(this)
+                upperHint,
+                lowerHint
             );
         } else {
             // Add collateral to existing trove and mint excess LUSD
