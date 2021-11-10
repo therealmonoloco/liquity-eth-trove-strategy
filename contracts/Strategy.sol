@@ -13,9 +13,7 @@ import {
 } from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
 import "../interfaces/liquity/IBorrowerOperations.sol";
-import "../interfaces/liquity/IHintHelpers.sol";
 import "../interfaces/liquity/IPriceFeed.sol";
-import "../interfaces/liquity/ISortedTroves.sol";
 import "../interfaces/liquity/ITroveManager.sol";
 import "../interfaces/uniswap/ISwapRouter.sol";
 import "../interfaces/weth/IWETH9.sol";
@@ -50,14 +48,6 @@ contract Strategy is BaseStrategy {
     // Trove Manager
     ITroveManager internal constant troveManager =
         ITroveManager(0xA39739EF8b0231DbFA0DcdA07d7e29faAbCf4bb2);
-
-    // Hint helper to optimize trove insertions
-    IHintHelpers internal constant hintHelpers =
-        IHintHelpers(0xE84251b93D9524E0d2e621Ba7dc7cb3579F997C0);
-
-    // Hint helper to optimize trove insertions
-    ISortedTroves internal constant sortedTroves =
-        ISortedTroves(0x8FdD3fbFEb32b28fb73555518f8b361bCeA741A6);
 
     // Uniswap v3 router to do LUSD->ETH
     ISwapRouter internal constant router =
@@ -100,6 +90,10 @@ contract Strategy is BaseStrategy {
     // If set to true the strategy will never try to repay debt by selling want
     bool public leaveDebtBehind;
 
+    // Hints to access trove list
+    address public upperHint;
+    address public lowerHint;
+
     constructor(address _vault, address _yVault) public BaseStrategy(_vault) {
         yVault = IVault(_yVault);
 
@@ -133,6 +127,18 @@ contract Strategy is BaseStrategy {
     receive() external payable {}
 
     // ----------------- SETTERS & MIGRATION -----------------
+
+    // Hints allow cheaper Trove operations for the user
+    // Due to the large number of troves currently in the system
+    // providing hints is compulsory to prevent out of gas reverts
+    function setHints(address _upperHint, address _lowerHint)
+        external
+        onlyEmergencyAuthorized
+    {
+        require(_upperHint != address(0) && _lowerHint != address(0)); // dev: invalid hints
+        upperHint = _upperHint;
+        lowerHint = _lowerHint;
+    }
 
     // Maximum acceptable borrowing fee (protocol minimum is 0.5%)
     // Allow lower values to effectively disable taking more debt
@@ -445,19 +451,17 @@ contract Strategy is BaseStrategy {
     // ----------------- INTERNAL FUNCTIONS SUPPORT -----------------
 
     function _withdrawLUSDFromTrove(uint256 amount) internal {
-        // TODO: provide hints
         borrowerOperations.withdrawLUSD(
             maxFeePercentage,
             amount,
-            address(this),
-            address(this)
+            upperHint,
+            lowerHint
         );
     }
 
     function _withdrawCollateralFromTrove(uint256 amount) internal {
-        // TODO: adjust upper and lower hints
         // TODO: repaying all debt should take collateral out of the trove to avoid redemptions
-        borrowerOperations.withdrawColl(amount, address(this), address(this));
+        borrowerOperations.withdrawColl(amount, upperHint, lowerHint);
 
         // Wrap ETH
         WETH.deposit();
@@ -592,8 +596,7 @@ contract Strategy is BaseStrategy {
         );
 
         if (amount > 0) {
-            // TODO: provide _upperHint and _lowerHint to consume less gas
-            borrowerOperations.repayLUSD(amount, address(this), address(this));
+            borrowerOperations.repayLUSD(amount, upperHint, lowerHint);
         }
     }
 
@@ -628,19 +631,6 @@ contract Strategy is BaseStrategy {
 
         if (balanceOfTrove() == 0) {
             // If this is the first time we need to open a new trove
-            // TODO: provide _upperHint and _lowerHint to consume less gas
-
-            uint256 numTroves = sortedTroves.getSize();
-            uint256 liquidationReserve = troveManager.LUSD_GAS_COMPENSATION();
-            uint256 expectedFee = troveManager.getBorrowingFeeWithDecay(lusdToMint);
-            uint256 expectedDebt = lusdToMint.add(expectedFee).add(liquidationReserve);
-            uint256 nicr = amount.mul(100).mul(1e18).div(expectedDebt);
-
-            (address approxHint, ,) = hintHelpers.getApproxHint(nicr, numTroves.mul(15), 123123);
-
-            (address upperHint, address lowerHint) = sortedTroves.findInsertPosition(nicr, approxHint, approxHint);
-            
-
             borrowerOperations.openTrove{value: amount}(
                 maxFeePercentage,
                 lusdToMint,
@@ -649,10 +639,9 @@ contract Strategy is BaseStrategy {
             );
         } else {
             // Add collateral to existing trove and mint excess LUSD
-            // TODO: provide _upperHint and _lowerHint to consume less gas
             borrowerOperations.addColl{value: amount}(
-                address(this),
-                address(this)
+                upperHint,
+                lowerHint
             );
             _withdrawLUSDFromTrove(lusdToMint);
         }
